@@ -10,6 +10,8 @@ from tensorflow.keras.applications.resnet_v2 import preprocess_input as resnet_p
 from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
 from tensorflow.keras.preprocessing.image import img_to_array
 from skimage import exposure, segmentation, feature, color, measure
+import cv2
+from skimage.feature import graycomatrix, graycoprops
 
 app = Flask(__name__, static_url_path='/static')
 
@@ -278,82 +280,63 @@ def analyze_severity_features(image):
         }
     }
 
-def calculate_severity_score(features, condition):
-    """Calculate severity score based on condition type and features."""
-    texture = features['texture']
-    shape = features['shape']
-    color = features['color']
+def calculate_texture_features(image):
+    # Convert to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Base severity score
-    severity_score = 0
+    # Calculate GLCM matrix
+    glcm = graycomatrix(gray, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
     
-    # Condition-specific severity analysis
-    if condition == 'حب الشباب':  # Acne
-        # Higher weight to texture and redness
-        severity_score = (
-            texture['contrast'] * 0.3 +
-            color['redness'] * 0.4 +
-            shape['area'] * 0.3
-        )
+    # Calculate texture properties
+    contrast = graycoprops(glcm, 'contrast')[0, 0]
+    dissimilarity = graycoprops(glcm, 'dissimilarity')[0, 0]
+    homogeneity = graycoprops(glcm, 'homogeneity')[0, 0]
+    energy = graycoprops(glcm, 'energy')[0, 0]
+    correlation = graycoprops(glcm, 'correlation')[0, 0]
     
-    elif condition == 'الإكزيما':  # Eczema
-        # Focus on texture and color variation
-        severity_score = (
-            texture['homogeneity'] * 0.3 +
-            color['variation'] * 0.4 +
-            shape['extent'] * 0.3
-        )
+    # Normalize values
+    max_vals = {'contrast': 100, 'dissimilarity': 10, 'homogeneity': 1, 'energy': 1, 'correlation': 1}
+    return {
+        'contrast': min(contrast / max_vals['contrast'], 1),
+        'dissimilarity': min(dissimilarity / max_vals['dissimilarity'], 1),
+        'homogeneity': homogeneity,
+        'energy': energy,
+        'correlation': correlation
+    }
+
+def calculate_color_features(image):
+    # Convert to HSV color space
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     
-    elif condition == 'الصدفية':  # Psoriasis
-        # Emphasis on scaling (texture) and area
-        severity_score = (
-            texture['contrast'] * 0.4 +
-            shape['area'] * 0.4 +
-            color['variation'] * 0.2
-        )
+    # Calculate color variation (standard deviation of hue)
+    hue_std = np.std(hsv[:,:,0]) / 180  # Normalize by max hue value
     
-    elif condition == 'البهاق':  # Vitiligo
-        # Focus on area and color variation
-        severity_score = (
-            shape['area'] * 0.5 +
-            color['variation'] * 0.5
-        )
+    # Calculate redness (mean of red channel relative to other channels)
+    b, g, r = cv2.split(image)
+    redness = np.mean(r) / (np.mean(g) + np.mean(b) + 1e-6)
+    redness = min(redness / 2, 1)  # Normalize redness
     
-    elif condition == 'حساسية الجلد':  # Skin Allergy
-        # Emphasis on redness and texture
-        severity_score = (
-            color['redness'] * 0.4 +
-            texture['contrast'] * 0.3 +
-            shape['extent'] * 0.3
-        )
+    return {
+        'variation': float(hue_std),
+        'redness': float(redness)
+    }
+
+def calculate_severity_score(features, confidence):
+    # Combine various features to calculate severity
+    texture_severity = (
+        features['texture']['contrast'] * 0.3 +
+        features['texture']['dissimilarity'] * 0.2 +
+        (1 - features['texture']['homogeneity']) * 0.2
+    )
     
-    elif condition == 'سرطان الجلد':  # Skin Cancer
-        # Complex analysis of all features
-        severity_score = (
-            shape['eccentricity'] * 0.3 +
-            texture['dissimilarity'] * 0.3 +
-            color['variation'] * 0.2 +
-            shape['area'] * 0.2
-        )
+    color_severity = (
+        features['color']['variation'] * 0.4 +
+        features['color']['redness'] * 0.6
+    )
     
-    else:  # Default scoring for other conditions
-        severity_score = (
-            texture['contrast'] * 0.25 +
-            color['variation'] * 0.25 +
-            shape['area'] * 0.25 +
-            color['redness'] * 0.25
-        )
-    
-    # Normalize score to 0-1 range
-    severity_score = min(max(severity_score, 0), 1)
-    
-    # Map score to severity levels
-    if severity_score < 0.3:
-        return 'خفيف', severity_score
-    elif severity_score < 0.7:
-        return 'متوسط', severity_score
-    else:
-        return 'شديد', severity_score
+    # Combine texture and color severity with confidence
+    severity_score = (texture_severity * 0.4 + color_severity * 0.6) * confidence
+    return min(severity_score, 1.0)
 
 def analyze_skin_condition(image):
     """Enhanced skin condition analysis with advanced severity assessment."""
@@ -397,19 +380,17 @@ def analyze_skin_condition(image):
         severity_features = analyze_severity_features(enhanced_image)
         
         # Calculate severity based on features
-        severity, severity_score = calculate_severity_score(severity_features, condition)
+        severity_score = calculate_severity_score(severity_features, adjusted_confidence)
         
         # Determine if urgent care is needed
         needs_urgent_care = (
-            severity == 'شديد' or 
-            condition == 'سرطان الجلد' or 
-            (severity_score > 0.7 and adjusted_confidence > 0.8)
+            severity_score > 0.7 and adjusted_confidence > 0.8
         )
         
         return {
             'condition': condition,
             'confidence': adjusted_confidence,
-            'severity': severity,
+            'severity': 'شديد' if severity_score > 0.7 else 'متوسط' if severity_score > 0.3 else 'خفيف',
             'severity_score': severity_score,
             'needs_urgent_care': needs_urgent_care,
             'features': severity_features
@@ -432,72 +413,62 @@ def home():
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image uploaded'})
+    
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({'error': 'No image selected'})
+    
     try:
-        if 'file' not in request.files:
-            return jsonify({'error': 'لم يتم تحميل أي صورة'})
+        # Read and preprocess the image
+        image_stream = file.read()
+        nparr = np.frombuffer(image_stream, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': 'لم يتم اختيار أي ملف'})
+        if image is None:
+            return jsonify({'error': 'Invalid image format'})
         
-        # Read and process the image
-        image_bytes = file.read()
-        image = Image.open(io.BytesIO(image_bytes))
+        # Calculate texture and color features
+        texture_features = calculate_texture_features(image)
+        color_features = calculate_color_features(image)
         
-        # Get enhanced prediction with severity analysis
-        result = analyze_skin_condition(image)
+        # Prepare image for model prediction
+        processed_image = preprocess_image(image)  # Your existing preprocessing function
         
-        # Get condition details
-        for category, conditions in SKIN_CONDITIONS.items():
-            if result['condition'] in conditions:
-                condition_details = conditions[result['condition']]
-                
-                # Create detailed response
-                response = {
-                    'condition': result['condition'],
-                    'confidence': result['confidence'],
-                    'severity': result['severity'],
-                    'severity_score': result['severity_score'],
-                    'needs_urgent_care': result['needs_urgent_care'],
-                    'medications': condition_details['medications'],
-                    'description': condition_details['description'],
-                    'category': category,
-                    'features': result['features'],
-                    'recommendation': (
-                        'يرجى استشارة الطبيب فوراً' if result['needs_urgent_care']
-                        else 'يرجى استشارة الطبيب للتأكيد' if result['confidence'] < 0.7
-                        else condition_details['description']
-                    )
-                }
-                
-                # Add severity-specific recommendations
-                if result['severity'] == 'شديد':
-                    response['urgent_care_needed'] = True
-                    response['severity_details'] = 'الحالة شديدة وتحتاج إلى عناية طبية عاجلة'
-                elif result['severity'] == 'متوسط':
-                    response['urgent_care_needed'] = False
-                    response['severity_details'] = 'الحالة متوسطة وتحتاج إلى متابعة طبية'
-                else:
-                    response['urgent_care_needed'] = False
-                    response['severity_details'] = 'الحالة خفيفة ويمكن علاجها بالأدوية الموصوفة'
-                
-                return jsonify(response)
+        # Get model prediction
+        prediction = model.predict(processed_image)
+        condition_index = np.argmax(prediction[0])
+        confidence = float(prediction[0][condition_index])
+        
+        # Calculate features and severity
+        features = {
+            'texture': texture_features,
+            'color': color_features
+        }
+        severity_score = calculate_severity_score(features, confidence)
+        
+        # Determine severity level in Arabic
+        severity_level = 'خفيف' if severity_score < 0.3 else 'متوسط' if severity_score < 0.7 else 'شديد'
+        
+        # Get condition details (your existing logic)
+        condition = conditions[condition_index]
+        description = condition_descriptions[condition_index]
+        medications = recommended_medications[condition_index]
         
         return jsonify({
-            'condition': result['condition'],
-            'confidence': result['confidence'],
-            'severity': result['severity'],
-            'severity_score': result['severity_score'],
-            'needs_urgent_care': result['needs_urgent_care'],
-            'medications': 'يرجى استشارة الطبيب',
-            'description': 'يرجى استشارة الطبيب للحصول على تشخيص دقيق',
-            'category': 'غير محدد',
-            'features': result['features'],
-            'recommendation': 'يرجى استشارة الطبيب للتأكيد'
+            'condition': condition,
+            'confidence': confidence,
+            'description': description,
+            'medications': medications,
+            'features': features,
+            'severity_score': severity_score,
+            'severity': severity_level
         })
         
     except Exception as e:
-        return jsonify({'error': str(e)})
+        print(f"Error processing image: {str(e)}")
+        return jsonify({'error': 'حدث خطأ أثناء معالجة الصورة'})
 
 if __name__ == '__main__':
     # Use environment variable for port with a default value
