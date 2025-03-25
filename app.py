@@ -4,9 +4,12 @@ import numpy as np
 from PIL import Image
 import io
 import os
-from tensorflow.keras.applications import DenseNet169
-from tensorflow.keras.applications.densenet import preprocess_input
+from tensorflow.keras.applications import DenseNet169, ResNet50V2, EfficientNetB4
+from tensorflow.keras.applications.densenet import preprocess_input as densenet_preprocess
+from tensorflow.keras.applications.resnet_v2 import preprocess_input as resnet_preprocess
+from tensorflow.keras.applications.efficientnet import preprocess_input as efficientnet_preprocess
 from tensorflow.keras.preprocessing.image import img_to_array
+from skimage import exposure, segmentation
 
 app = Flask(__name__, static_url_path='/static')
 
@@ -91,8 +94,12 @@ SKIN_CONDITIONS = {
     }
 }
 
-# Global variable for the model
-model = None
+# Initialize models globally
+models = {
+    'densenet': None,
+    'resnet': None,
+    'efficientnet': None
+}
 
 def get_all_conditions():
     """Get a flat list of all conditions."""
@@ -105,96 +112,173 @@ def get_all_conditions():
 if not os.path.exists('static'):
     os.makedirs('static')
 
-def load_model():
-    """Load and prepare the model."""
-    global model
-    if model is None:
-        # Base model with pre-trained weights
+def load_models():
+    """Load multiple models for ensemble prediction."""
+    global models
+    
+    if models['densenet'] is None:
+        # DenseNet for detailed feature extraction
         base_model = DenseNet169(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-        
-        # Add custom layers for skin condition classification
-        x = base_model.output
-        x = tf.keras.layers.GlobalAveragePooling2D()(x)
+        x = tf.keras.layers.GlobalAveragePooling2D()(base_model.output)
         x = tf.keras.layers.Dense(1024, activation='relu')(x)
-        x = tf.keras.layers.Dropout(0.5)(x)  # Add dropout for better generalization
+        x = tf.keras.layers.Dropout(0.5)(x)
         predictions = tf.keras.layers.Dense(len(SKIN_CONDITIONS), activation='softmax')(x)
-        
-        model = tf.keras.Model(inputs=base_model.input, outputs=predictions)
-        
-        # Freeze the base model layers
-        for layer in base_model.layers:
-            layer.trainable = False
-            
-    return model
+        models['densenet'] = tf.keras.Model(inputs=base_model.input, outputs=predictions)
+    
+    if models['resnet'] is None:
+        # ResNet for hierarchical feature learning
+        base_model = ResNet50V2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+        x = tf.keras.layers.GlobalAveragePooling2D()(base_model.output)
+        x = tf.keras.layers.Dense(1024, activation='relu')(x)
+        x = tf.keras.layers.Dropout(0.5)(x)
+        predictions = tf.keras.layers.Dense(len(SKIN_CONDITIONS), activation='softmax')(x)
+        models['resnet'] = tf.keras.Model(inputs=base_model.input, outputs=predictions)
+    
+    if models['efficientnet'] is None:
+        # EfficientNet for mobile-optimized inference
+        base_model = EfficientNetB4(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+        x = tf.keras.layers.GlobalAveragePooling2D()(base_model.output)
+        x = tf.keras.layers.Dense(1024, activation='relu')(x)
+        x = tf.keras.layers.Dropout(0.5)(x)
+        predictions = tf.keras.layers.Dense(len(SKIN_CONDITIONS), activation='softmax')(x)
+        models['efficientnet'] = tf.keras.Model(inputs=base_model.input, outputs=predictions)
 
-def preprocess_skin_image(image):
-    """
-    Specialized preprocessing for skin condition images.
-    """
+def segment_skin_region(image):
+    """Segment the skin region from the image."""
     # Convert to RGB if needed
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
-    # Resize to standard size
-    image = image.resize((224, 224))
-    
     # Convert to array
-    img_array = img_to_array(image)
+    img_array = np.array(image)
     
-    # Apply color normalization
-    img_array = img_array.astype(float) / 255.0
+    # Apply SLIC segmentation
+    segments = segmentation.slic(img_array, n_segments=100, compactness=10)
     
-    # Apply contrast enhancement
-    mean = np.mean(img_array)
-    std = np.std(img_array)
-    img_array = (img_array - mean) / (std + 1e-7)
+    # Create mask for skin-colored regions
+    skin_mask = np.zeros(img_array.shape[:2], dtype=bool)
     
-    # Add batch dimension
-    img_array = np.expand_dims(img_array, axis=0)
+    for segment_id in np.unique(segments):
+        segment = segments == segment_id
+        segment_color = img_array[segment].mean(axis=0)
+        
+        # Skin color detection in RGB space
+        r, g, b = segment_color
+        is_skin = (r > 95 and g > 40 and b > 20 and
+                  max(r, g, b) - min(r, g, b) > 15 and
+                  abs(r - g) > 15 and r > g and r > b)
+        
+        if is_skin:
+            skin_mask[segment] = True
     
-    return img_array
+    # Apply mask to original image
+    segmented_image = img_array.copy()
+    segmented_image[~skin_mask] = [0, 0, 0]
+    
+    return Image.fromarray(segmented_image)
+
+def enhance_image_quality(image):
+    """Enhance image quality for better feature detection."""
+    # Convert to array
+    img_array = np.array(image)
+    
+    # Enhance contrast using adaptive histogram equalization
+    img_array_lab = exposure.equalize_adapthist(img_array)
+    
+    # Denoise
+    img_array_denoised = exposure.denoise_bilateral(img_array_lab)
+    
+    return Image.fromarray((img_array_denoised * 255).astype(np.uint8))
+
+def get_ensemble_prediction(image):
+    """Get predictions from multiple models and combine them."""
+    predictions = []
+    
+    # Preprocess image for each model
+    img_densenet = densenet_preprocess(np.array(image.resize((224, 224))))
+    img_resnet = resnet_preprocess(np.array(image.resize((224, 224))))
+    img_efficientnet = efficientnet_preprocess(np.array(image.resize((224, 224))))
+    
+    # Get predictions from each model
+    pred_densenet = models['densenet'].predict(np.expand_dims(img_densenet, axis=0))
+    pred_resnet = models['resnet'].predict(np.expand_dims(img_resnet, axis=0))
+    pred_efficientnet = models['efficientnet'].predict(np.expand_dims(img_efficientnet, axis=0))
+    
+    # Weighted average of predictions (can be adjusted based on model performance)
+    weights = [0.4, 0.3, 0.3]  # DenseNet, ResNet, EfficientNet
+    ensemble_pred = (weights[0] * pred_densenet +
+                    weights[1] * pred_resnet +
+                    weights[2] * pred_efficientnet)
+    
+    return ensemble_pred[0]
 
 def analyze_skin_condition(image):
-    """
-    Analyze skin condition using specialized model and preprocessing.
-    """
+    """Enhanced skin condition analysis with multiple models and preprocessing."""
     try:
-        # Ensure model is loaded
-        model = load_model()
+        # Load models if not loaded
+        load_models()
         
-        # Preprocess the image with specialized techniques
-        processed_image = preprocess_skin_image(image)
+        # Segment skin region
+        segmented_image = segment_skin_region(image)
         
-        # Get model predictions
-        predictions = model.predict(processed_image)
+        # Enhance image quality
+        enhanced_image = enhance_image_quality(segmented_image)
+        
+        # Get ensemble predictions
+        predictions = get_ensemble_prediction(enhanced_image)
         
         # Get top prediction and confidence
-        predicted_index = np.argmax(predictions[0])
-        confidence = float(predictions[0][predicted_index])
+        predicted_index = np.argmax(predictions)
+        confidence = float(predictions[predicted_index])
         
-        # Map to skin conditions
+        # Enhanced confidence calculation
+        confidence_threshold = 0.6
+        secondary_confidence = sorted(predictions)[-2]  # Second highest confidence
+        confidence_margin = confidence - secondary_confidence
+        
+        # Adjust confidence based on prediction margin
+        adjusted_confidence = confidence * (1 + confidence_margin)
+        
+        # Map to skin conditions with enhanced logic
         conditions_mapping = {
-            0: 'حب الشباب',          # Acne
-            1: 'الإكزيما',           # Eczema
-            2: 'الصدفية',           # Psoriasis
-            3: 'البهاق',            # Vitiligo
-            4: 'حساسية الجلد',       # Skin Allergy
-            5: 'العد الوردي',        # Rosacea
-            6: 'سرطان الجلد',        # Skin Cancer
-            7: 'الطفح الجلدي'        # Rash
+            0: {'name': 'حب الشباب', 'severity': ['خفيف', 'متوسط', 'شديد']},
+            1: {'name': 'الإكزيما', 'severity': ['خفيف', 'متوسط', 'شديد']},
+            2: {'name': 'الصدفية', 'severity': ['خفيف', 'متوسط', 'شديد']},
+            3: {'name': 'البهاق', 'severity': ['محدود', 'متوسط', 'منتشر']},
+            4: {'name': 'حساسية الجلد', 'severity': ['خفيف', 'متوسط', 'شديد']},
+            5: {'name': 'العد الوردي', 'severity': ['مبكر', 'متوسط', 'متقدم']},
+            6: {'name': 'سرطان الجلد', 'severity': ['مبكر', 'متوسط', 'متقدم']},
+            7: {'name': 'الطفح الجلدي', 'severity': ['خفيف', 'متوسط', 'شديد']}
         }
         
-        condition = conditions_mapping.get(predicted_index, 'حساسية الجلد')
+        condition_info = conditions_mapping.get(predicted_index)
         
-        # Apply confidence threshold
-        if confidence < 0.5:
-            return 'يرجى التحقق من جودة الصورة', 0.0
+        # Determine severity based on confidence
+        severity_index = 0
+        if adjusted_confidence > 0.8:
+            severity_index = 2
+        elif adjusted_confidence > 0.6:
+            severity_index = 1
         
-        return condition, confidence
+        condition = condition_info['name']
+        severity = condition_info['severity'][severity_index]
+        
+        # Return enhanced results
+        return {
+            'condition': condition,
+            'confidence': adjusted_confidence,
+            'severity': severity,
+            'needs_urgent_care': severity_index == 2 or condition == 'سرطان الجلد'
+        }
         
     except Exception as e:
         print(f"Error in skin condition analysis: {str(e)}")
-        return 'يرجى التحقق من جودة الصورة', 0.0
+        return {
+            'condition': 'يرجى التحقق من جودة الصورة',
+            'confidence': 0.0,
+            'severity': 'غير محدد',
+            'needs_urgent_care': False
+        }
 
 @app.route('/')
 def home():
@@ -214,25 +298,31 @@ def predict():
         image_bytes = file.read()
         image = Image.open(io.BytesIO(image_bytes))
         
-        # Get prediction with improved model
-        condition, confidence = analyze_skin_condition(image)
+        # Get enhanced prediction
+        result = analyze_skin_condition(image)
         
         # Get condition details from your existing dictionary
         for category, conditions in SKIN_CONDITIONS.items():
-            if condition in conditions:
-                condition_details = conditions[condition]
+            if result['condition'] in conditions:
+                condition_details = conditions[result['condition']]
                 return jsonify({
-                    'condition': condition,
-                    'confidence': confidence,
+                    'condition': result['condition'],
+                    'confidence': result['confidence'],
+                    'severity': result['severity'],
+                    'needs_urgent_care': result['needs_urgent_care'],
                     'medications': condition_details['medications'],
                     'description': condition_details['description'],
                     'category': category,
-                    'recommendation': 'يرجى استشارة الطبيب للتأكيد' if confidence < 0.7 else condition_details['description']
+                    'recommendation': 'يرجى استشارة الطبيب فوراً' if result['needs_urgent_care'] 
+                                    else 'يرجى استشارة الطبيب للتأكيد' if result['confidence'] < 0.7 
+                                    else condition_details['description']
                 })
         
         return jsonify({
-            'condition': condition,
-            'confidence': confidence,
+            'condition': result['condition'],
+            'confidence': result['confidence'],
+            'severity': result['severity'],
+            'needs_urgent_care': result['needs_urgent_care'],
             'medications': 'يرجى استشارة الطبيب',
             'description': 'يرجى استشارة الطبيب للحصول على تشخيص دقيق',
             'category': 'غير محدد',
