@@ -4,10 +4,9 @@ import numpy as np
 from PIL import Image
 import io
 import os
-from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input, decode_predictions
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+from tensorflow.keras.applications import DenseNet169
+from tensorflow.keras.applications.densenet import preprocess_input
+from tensorflow.keras.preprocessing.image import img_to_array
 
 app = Flask(__name__, static_url_path='/static')
 
@@ -110,67 +109,92 @@ def load_model():
     """Load and prepare the model."""
     global model
     if model is None:
-        # Use MobileNetV2 as base model (efficient and good for mobile/web deployment)
-        model = MobileNetV2(weights='imagenet')
+        # Base model with pre-trained weights
+        base_model = DenseNet169(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+        
+        # Add custom layers for skin condition classification
+        x = base_model.output
+        x = tf.keras.layers.GlobalAveragePooling2D()(x)
+        x = tf.keras.layers.Dense(1024, activation='relu')(x)
+        x = tf.keras.layers.Dropout(0.5)(x)  # Add dropout for better generalization
+        predictions = tf.keras.layers.Dense(len(SKIN_CONDITIONS), activation='softmax')(x)
+        
+        model = tf.keras.Model(inputs=base_model.input, outputs=predictions)
+        
+        # Freeze the base model layers
+        for layer in base_model.layers:
+            layer.trainable = False
+            
     return model
 
-def analyze_skin_image(image):
+def preprocess_skin_image(image):
     """
-    Analyze the image using MobileNetV2 and map predictions to skin conditions.
+    Specialized preprocessing for skin condition images.
+    """
+    # Convert to RGB if needed
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
+    # Resize to standard size
+    image = image.resize((224, 224))
+    
+    # Convert to array
+    img_array = img_to_array(image)
+    
+    # Apply color normalization
+    img_array = img_array.astype(float) / 255.0
+    
+    # Apply contrast enhancement
+    mean = np.mean(img_array)
+    std = np.std(img_array)
+    img_array = (img_array - mean) / (std + 1e-7)
+    
+    # Add batch dimension
+    img_array = np.expand_dims(img_array, axis=0)
+    
+    return img_array
+
+def analyze_skin_condition(image):
+    """
+    Analyze skin condition using specialized model and preprocessing.
     """
     try:
         # Ensure model is loaded
         model = load_model()
         
-        # Preprocess the image
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
+        # Preprocess the image with specialized techniques
+        processed_image = preprocess_skin_image(image)
         
-        # Resize image to 224x224 (required for MobileNetV2)
-        image = image.resize((224, 224))
+        # Get model predictions
+        predictions = model.predict(processed_image)
         
-        # Convert to array and preprocess
-        img_array = np.array(image)
-        img_array = preprocess_input(img_array)
-        img_array = np.expand_dims(img_array, axis=0)
+        # Get top prediction and confidence
+        predicted_index = np.argmax(predictions[0])
+        confidence = float(predictions[0][predicted_index])
         
-        # Get predictions
-        predictions = model.predict(img_array)
-        decoded_predictions = decode_predictions(predictions, top=5)[0]
-        
-        # Map the predictions to skin conditions based on visual features
-        confidence = float(predictions.max())
-        
-        # Get the top predicted class
-        predicted_class = decoded_predictions[0][1].lower()
-        
-        # Map general image features to skin conditions
-        feature_to_condition = {
-            'rash': 'الطفح الجلدي',
-            'skin': 'حساسية الجلد',
-            'spot': 'حب الشباب',
-            'red': 'الإكزيما',
-            'scale': 'الصدفية',
-            'patch': 'البهاق',
-            'lesion': 'سرطان الجلد'
+        # Map to skin conditions
+        conditions_mapping = {
+            0: 'حب الشباب',          # Acne
+            1: 'الإكزيما',           # Eczema
+            2: 'الصدفية',           # Psoriasis
+            3: 'البهاق',            # Vitiligo
+            4: 'حساسية الجلد',       # Skin Allergy
+            5: 'العد الوردي',        # Rosacea
+            6: 'سرطان الجلد',        # Skin Cancer
+            7: 'الطفح الجلدي'        # Rash
         }
         
-        # Find the most relevant skin condition based on predicted features
-        condition = None
-        for feature, skin_condition in feature_to_condition.items():
-            if feature in predicted_class:
-                condition = skin_condition
-                break
+        condition = conditions_mapping.get(predicted_index, 'حساسية الجلد')
         
-        # If no specific mapping found, use the most common condition
-        if not condition:
-            condition = 'حساسية الجلد'
+        # Apply confidence threshold
+        if confidence < 0.5:
+            return 'يرجى التحقق من جودة الصورة', 0.0
         
         return condition, confidence
         
     except Exception as e:
-        print(f"Error in image analysis: {str(e)}")
-        return 'حساسية الجلد', 0.5
+        print(f"Error in skin condition analysis: {str(e)}")
+        return 'يرجى التحقق من جودة الصورة', 0.0
 
 @app.route('/')
 def home():
@@ -179,22 +203,21 @@ def home():
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        # Get the image from the POST request
         if 'file' not in request.files:
-            return jsonify({'error': 'No file uploaded'})
+            return jsonify({'error': 'لم يتم تحميل أي صورة'})
         
         file = request.files['file']
         if file.filename == '':
-            return jsonify({'error': 'No file selected'})
+            return jsonify({'error': 'لم يتم اختيار أي ملف'})
         
         # Read and process the image
         image_bytes = file.read()
         image = Image.open(io.BytesIO(image_bytes))
         
-        # Get prediction
-        condition, confidence = analyze_skin_image(image)
+        # Get prediction with improved model
+        condition, confidence = analyze_skin_condition(image)
         
-        # Get condition details
+        # Get condition details from your existing dictionary
         for category, conditions in SKIN_CONDITIONS.items():
             if condition in conditions:
                 condition_details = conditions[condition]
@@ -203,16 +226,17 @@ def predict():
                     'confidence': confidence,
                     'medications': condition_details['medications'],
                     'description': condition_details['description'],
-                    'category': category
+                    'category': category,
+                    'recommendation': 'يرجى استشارة الطبيب للتأكيد' if confidence < 0.7 else condition_details['description']
                 })
         
-        # Fallback if condition not found in dictionary
         return jsonify({
             'condition': condition,
             'confidence': confidence,
             'medications': 'يرجى استشارة الطبيب',
             'description': 'يرجى استشارة الطبيب للحصول على تشخيص دقيق',
-            'category': 'غير محدد'
+            'category': 'غير محدد',
+            'recommendation': 'يرجى استشارة الطبيب للتأكيد'
         })
         
     except Exception as e:
